@@ -1,0 +1,22 @@
+# HID enumeration using pywinusb
+bl_info = {"name":"SteamDeck HID Enum"}
+
+import bpy
+try:
+    from pywinusb import hid
+except Exception as e:
+    print("pywinusb import failed:", e)
+    raise
+
+# Filter by vendor/product for Steam Deck
+VID = 0x28DE
+PID = 0x1205
+
+devices = hid.HidDeviceFilter(vendor_id=VID, product_id=PID).get_devices()
+print("Found devices count:", len(devices))
+for i, d in enumerate(devices):
+    try:
+        print(i, "path:", d.device_path)
+        print("  vendor:", hex(d.vendor_id), "product:", hex(d.product_id), "name:", d.product_name)
+    except Exception as e:
+        print("  inspect error:", e)
