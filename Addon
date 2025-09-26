@@ -1,0 +1,260 @@
+import bpy
+import hid
+import struct
+from mathutils import Euler, Vector
+
+# -------------------------------
+# Settings
+# -------------------------------
+DEADZONE = 12000         # Deadzone for analog sticks
+ROTATE_SCALE = 0.05      # Right stick rotation sensitivity
+PAN_SCALE = 0.05         # Left stick pan sensitivity
+TRIGGER_THRESHOLD = 5    # Trigger press threshold
+
+# -------------------------------
+# Deadzone Helper
+# -------------------------------
+def apply_deadzone(value, deadzone=DEADZONE):
+    return 0 if abs(value) < deadzone else value
+
+# -------------------------------
+# Decode HID data
+# -------------------------------
+def decode_deck_report(data):
+    if len(data) < 16:
+        return None
+
+    data_bytes = bytes(data)
+
+    # Analog sticks (signed 16-bit)
+    lx = apply_deadzone(struct.unpack_from("<h", data_bytes, 0)[0])
+    ly = apply_deadzone(struct.unpack_from("<h", data_bytes, 2)[0])
+    rx = apply_deadzone(struct.unpack_from("<h", data_bytes, 4)[0])
+    ry = apply_deadzone(struct.unpack_from("<h", data_bytes, 6)[0])
+
+    # Triggers (0-255)
+    lt = data_bytes[12]
+    rt = data_bytes[13]
+
+    analog = {"lx": lx, "ly": ly, "rx": rx, "ry": ry, "lt": lt, "rt": rt}
+
+    # Buttons
+    buttons_triggers = data_bytes[8]
+    buttons_dpad = data_bytes[9]
+    pressed = []
+
+    if buttons_triggers & 0x01: pressed.append("R2")
+    if buttons_triggers & 0x02: pressed.append("L2")
+    if buttons_triggers & 0x04: pressed.append("R1")
+    if buttons_triggers & 0x08: pressed.append("L1")
+    if buttons_triggers & 0x10: pressed.append("Y")
+    if buttons_triggers & 0x20: pressed.append("B")
+    if buttons_triggers & 0x40: pressed.append("X")
+    if buttons_triggers & 0x80: pressed.append("A")
+    if buttons_dpad & 0x01: pressed.append("DPad Up")
+    if buttons_dpad & 0x02: pressed.append("DPad Right")
+    if buttons_dpad & 0x04: pressed.append("DPad Left")
+    if buttons_dpad & 0x08: pressed.append("DPad Down")
+
+    return {"buttons": pressed, "analog": analog}
+
+# -------------------------------
+# Get 3D View context
+# -------------------------------
+def get_3d_view_context(context):
+    for area in context.screen.areas:
+        if area.type == 'VIEW_3D':
+            for region in area.regions:
+                if region.type == 'WINDOW':
+                    return {'area': area, 'region': region}, area, area.spaces.active.region_3d
+    return None, None, None
+
+# -------------------------------
+# Pan viewport (left stick)
+# -------------------------------
+def pan_view(decoded, context):
+    _, area, rv3d = get_3d_view_context(context)
+    if not rv3d:
+        return
+
+    analog = decoded['analog']
+    dx = analog['lx'] / 32768 * PAN_SCALE
+    dy = analog['ly'] / 32768 * PAN_SCALE
+
+    if dx == 0 and dy == 0:
+        return
+
+    # Pan using rv3d.view_location offset
+    right = rv3d.view_rotation @ Vector((1, 0, 0))
+    up = rv3d.view_rotation @ Vector((0, 1, 0))
+    rv3d.view_location += -(right * dx + up * dy)
+
+    if area:
+        area.tag_redraw()
+
+# -------------------------------
+# Rotate viewport (right stick)
+# -------------------------------
+def rotate_view(decoded, context):
+    _, area, rv3d = get_3d_view_context(context)
+    if not rv3d:
+        return
+
+    analog = decoded['analog']
+    delta_rx = analog['rx'] / 32768 * ROTATE_SCALE
+    delta_ry = analog['ry'] / 32768 * ROTATE_SCALE
+
+    if delta_rx == 0 and delta_ry == 0:
+        return
+
+    eul = rv3d.view_rotation.to_euler()
+    eul.rotate_axis("Z", -delta_rx)  # horizontal rotation
+    eul.rotate_axis("X", -delta_ry)  # vertical rotation
+    eul.x = max(min(eul.x, 1.57), -1.57)  # clamp tilt (-90°..90°)
+    rv3d.view_rotation = eul.to_quaternion()
+
+    if area:
+        area.tag_redraw()
+
+# -------------------------------
+# Button Mapping
+# -------------------------------
+def handle_buttons(decoded, context):
+    override, area, _ = get_3d_view_context(context)
+    if not override:
+        return
+
+    for b in decoded['buttons']:
+        try:
+            if b == "A":
+                bpy.ops.object.select_all(override, action='SELECT')
+                print("A: Select all")
+            elif b == "B":
+                bpy.ops.object.hide_view_clear(override)
+                print("B: Show all")
+            elif b == "X":
+                bpy.ops.object.delete(override)
+                print("X: Delete")
+            elif b == "Y":
+                bpy.ops.object.duplicate_move(override)
+                print("Y: Duplicate")
+            elif b == "DPad Up":
+                bpy.ops.view3d.view_axis(override, type='TOP')
+            elif b == "DPad Down":
+                bpy.ops.view3d.view_axis(override, type='BOTTOM')
+            elif b == "DPad Left":
+                bpy.ops.view3d.view_axis(override, type='LEFT')
+            elif b == "DPad Right":
+                bpy.ops.view3d.view_axis(override, type='RIGHT')
+            elif b == "L1":
+                if context.active_object:
+                    mode = 'EDIT' if context.active_object.mode == 'OBJECT' else 'OBJECT'
+                    bpy.ops.object.mode_set(override, mode=mode)
+            elif b == "R1":
+                bpy.ops.mesh.primitive_cube_add(override)
+            elif b == "L2" and decoded['analog']['lt'] > TRIGGER_THRESHOLD:
+                bpy.ops.ed.undo()
+            elif b == "R2" and decoded['analog']['rt'] > TRIGGER_THRESHOLD:
+                bpy.ops.ed.redo()
+            if area:
+                area.tag_redraw()
+        except Exception as e:
+            print(f"Button action error ({b}): {e}")
+
+# -------------------------------
+# Modal Operator
+# -------------------------------
+class SteamDeckOperator(bpy.types.Operator):
+    bl_idname = "wm.steam_deck_operator"
+    bl_label = "Steam Deck Controller"
+
+    _timer = None
+    h = None
+    last_analog = None
+    last_buttons = None
+
+    def modal(self, context, event):
+        if event.type == 'TIMER':
+            try:
+                data = self.h.read(64, timeout_ms=200)
+                if data:
+                    decoded = decode_deck_report(data)
+                    if decoded:
+                        if decoded['buttons'] != self.last_buttons:
+                            handle_buttons(decoded, context)
+                            self.last_buttons = decoded['buttons']
+                        if decoded['analog']:
+                            pan_view(decoded, context)
+                            rotate_view(decoded, context)
+                            self.last_analog = decoded['analog']
+            except Exception as e:
+                print("Read error:", e)
+
+        if event.type == 'ESC' or not context.window_manager.get('steam_deck_active', True):
+            self.cancel(context)
+            return {'CANCELLED'}
+
+        return {'PASS_THROUGH'}
+
+    def execute(self, context):
+        devices = hid.enumerate(0x28DE, 0x1205)
+        if not devices:
+            self.report({'ERROR'}, "No Steam Deck devices found")
+            return {'CANCELLED'}
+
+        self.h = hid.device()
+        for iface in [2, 1]:
+            for device in devices:
+                if device['interface_number'] == iface:
+                    try:
+                        self.h.open_path(device['path'])
+                        print(f"Connected to interface {iface}")
+                        break
+                    except Exception as e:
+                        print(f"Failed to open interface {iface}: {e}")
+            else:
+                continue
+            break
+        else:
+            self.report({'ERROR'}, "No suitable interface found")
+            return {'CANCELLED'}
+
+        self.h.set_nonblocking(True)
+        wm = context.window_manager
+        wm['steam_deck_active'] = True
+        self._timer = wm.event_timer_add(0.015, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        wm = context.window_manager
+        wm['steam_deck_active'] = False
+        if self._timer:
+            wm.event_timer_remove(self._timer)
+        if self.h:
+            self.h.close()
+        print("Steam Deck controller stopped")
+
+# -------------------------------
+# Register
+# -------------------------------
+def register():
+    try:
+        bpy.utils.unregister_class(SteamDeckOperator)
+        if 'steam_deck_active' in bpy.types.WindowManager.__annotations__:
+            del bpy.types.WindowManager.steam_deck_active
+    except:
+        pass
+    bpy.utils.register_class(SteamDeckOperator)
+    bpy.types.WindowManager.steam_deck_active = bpy.props.BoolProperty(default=False)
+
+def unregister():
+    try:
+        bpy.utils.unregister_class(SteamDeckOperator)
+        if 'steam_deck_active' in bpy.types.WindowManager.__annotations__:
+            del bpy.types.WindowManager.steam_deck_active
+    except:
+        pass
+
+if __name__ == "__main__":
+    register()
