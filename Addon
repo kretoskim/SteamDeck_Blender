@@ -1,21 +1,12 @@
 import bpy
 import hid
 import struct
-from mathutils import Euler, Vector
+import mathutils
 
 # -------------------------------
 # Settings
 # -------------------------------
-DEADZONE = 12000         # Deadzone for analog sticks
-ROTATE_SCALE = 0.05      # Right stick rotation sensitivity
-PAN_SCALE = 0.05         # Left stick pan sensitivity
-TRIGGER_THRESHOLD = 5    # Trigger press threshold
-
-# -------------------------------
-# Deadzone Helper
-# -------------------------------
-def apply_deadzone(value, deadzone=DEADZONE):
-    return 0 if abs(value) < deadzone else value
+ROTATE_STEP = 0.0157079  # ~0.9° per tick (~60°/s at 66.67 ticks/s)
 
 # -------------------------------
 # Decode HID data
@@ -25,18 +16,6 @@ def decode_deck_report(data):
         return None
 
     data_bytes = bytes(data)
-
-    # Analog sticks (signed 16-bit)
-    lx = apply_deadzone(struct.unpack_from("<h", data_bytes, 0)[0])
-    ly = apply_deadzone(struct.unpack_from("<h", data_bytes, 2)[0])
-    rx = apply_deadzone(struct.unpack_from("<h", data_bytes, 4)[0])
-    ry = apply_deadzone(struct.unpack_from("<h", data_bytes, 6)[0])
-
-    # Triggers (0-255)
-    lt = data_bytes[12]
-    rt = data_bytes[13]
-
-    analog = {"lx": lx, "ly": ly, "rx": rx, "ry": ry, "lt": lt, "rt": rt}
 
     # Buttons
     buttons_triggers = data_bytes[8]
@@ -56,7 +35,7 @@ def decode_deck_report(data):
     if buttons_dpad & 0x04: pressed.append("DPad Left")
     if buttons_dpad & 0x08: pressed.append("DPad Down")
 
-    return {"buttons": pressed, "analog": analog}
+    return {"buttons": pressed}
 
 # -------------------------------
 # Get 3D View context
@@ -66,65 +45,62 @@ def get_3d_view_context(context):
         if area.type == 'VIEW_3D':
             for region in area.regions:
                 if region.type == 'WINDOW':
-                    return {'area': area, 'region': region}, area, area.spaces.active.region_3d
+                    override = {'area': area, 'region': region, 'space_data': area.spaces.active}
+                    return override, area, area.spaces.active.region_3d
+    print("Error: No 3D Viewport found")
     return None, None, None
 
 # -------------------------------
-# Pan viewport (left stick)
-# -------------------------------
-def pan_view(decoded, context):
-    _, area, rv3d = get_3d_view_context(context)
-    if not rv3d:
-        return
-
-    analog = decoded['analog']
-    dx = analog['lx'] / 32768 * PAN_SCALE
-    dy = analog['ly'] / 32768 * PAN_SCALE
-
-    if dx == 0 and dy == 0:
-        return
-
-    # Pan using rv3d.view_location offset
-    right = rv3d.view_rotation @ Vector((1, 0, 0))
-    up = rv3d.view_rotation @ Vector((0, 1, 0))
-    rv3d.view_location += -(right * dx + up * dy)
-
-    if area:
-        area.tag_redraw()
-
-# -------------------------------
-# Rotate viewport (right stick)
-# -------------------------------
-def rotate_view(decoded, context):
-    _, area, rv3d = get_3d_view_context(context)
-    if not rv3d:
-        return
-
-    analog = decoded['analog']
-    delta_rx = analog['rx'] / 32768 * ROTATE_SCALE
-    delta_ry = analog['ry'] / 32768 * ROTATE_SCALE
-
-    if delta_rx == 0 and delta_ry == 0:
-        return
-
-    eul = rv3d.view_rotation.to_euler()
-    eul.rotate_axis("Z", -delta_rx)  # horizontal rotation
-    eul.rotate_axis("X", -delta_ry)  # vertical rotation
-    eul.x = max(min(eul.x, 1.57), -1.57)  # clamp tilt (-90°..90°)
-    rv3d.view_rotation = eul.to_quaternion()
-
-    if area:
-        area.tag_redraw()
-
-# -------------------------------
-# Button Mapping
+# Handle button actions
 # -------------------------------
 def handle_buttons(decoded, context):
-    override, area, _ = get_3d_view_context(context)
-    if not override:
+    override, area, rv3d = get_3d_view_context(context)
+    if not override or not rv3d:
         return
 
-    for b in decoded['buttons']:
+    buttons = decoded['buttons']
+    non_repeat_buttons = [b for b in buttons if b not in {"L1", "R1", "L2", "R2"}]
+
+    # Continuous rotation with L1/R1/L2/R2
+    if "L1" in buttons:
+        try:
+            bpy.ops.view3d.view_orbit(override, angle_x=0, angle_y=ROTATE_STEP)
+            print("L1: Rotate left (Numpad 4)")
+        except Exception as e:
+            print(f"L1 rotation error: {e}")
+            quat = mathutils.Quaternion((0, 0, 1), ROTATE_STEP)
+            rv3d.view_rotation = quat @ rv3d.view_rotation
+            print("L1: Rotate left (Numpad 4, fallback)")
+    if "R1" in buttons:
+        try:
+            bpy.ops.view3d.view_orbit(override, angle_x=0, angle_y=-ROTATE_STEP)
+            print("R1: Rotate right (Numpad 6)")
+        except Exception as e:
+            print(f"R1 rotation error: {e}")
+            quat = mathutils.Quaternion((0, 0, 1), -ROTATE_STEP)
+            rv3d.view_rotation = quat @ rv3d.view_rotation
+            print("R1: Rotate right (Numpad 6, fallback)")
+    if "L2" in buttons:
+        try:
+            bpy.ops.view3d.view_orbit(override, angle_x=0, angle_y=ROTATE_STEP)
+            print("L2: Rotate down (Numpad 2)")
+        except Exception as e:
+            print(f"L2 rotation error: {e}")
+            quat = mathutils.Quaternion((0, 1, 0), ROTATE_STEP)
+            rv3d.view_rotation = quat @ rv3d.view_rotation
+            print("L2: Rotate down (Numpad 2, fallback)")
+    if "R2" in buttons:
+        try:
+            bpy.ops.view3d.view_orbit(override, angle_x=0, angle_y=-ROTATE_STEP)
+            print("R2: Rotate up (Numpad 8)")
+        except Exception as e:
+            print(f"R2 rotation error: {e}")
+            quat = mathutils.Quaternion((0, 1, 0), -ROTATE_STEP)
+            rv3d.view_rotation = quat @ rv3d.view_rotation
+            print("R2: Rotate up (Numpad 8, fallback)")
+
+    # Handle non-repeating buttons
+    for b in non_repeat_buttons:
         try:
             if b == "A":
                 bpy.ops.object.select_all(override, action='SELECT')
@@ -140,26 +116,21 @@ def handle_buttons(decoded, context):
                 print("Y: Duplicate")
             elif b == "DPad Up":
                 bpy.ops.view3d.view_axis(override, type='TOP')
+                print("DPad Up: Top view")
             elif b == "DPad Down":
                 bpy.ops.view3d.view_axis(override, type='BOTTOM')
+                print("DPad Down: Bottom view")
             elif b == "DPad Left":
                 bpy.ops.view3d.view_axis(override, type='LEFT')
+                print("DPad Left: Left view")
             elif b == "DPad Right":
                 bpy.ops.view3d.view_axis(override, type='RIGHT')
-            elif b == "L1":
-                if context.active_object:
-                    mode = 'EDIT' if context.active_object.mode == 'OBJECT' else 'OBJECT'
-                    bpy.ops.object.mode_set(override, mode=mode)
-            elif b == "R1":
-                bpy.ops.mesh.primitive_cube_add(override)
-            elif b == "L2" and decoded['analog']['lt'] > TRIGGER_THRESHOLD:
-                bpy.ops.ed.undo()
-            elif b == "R2" and decoded['analog']['rt'] > TRIGGER_THRESHOLD:
-                bpy.ops.ed.redo()
-            if area:
-                area.tag_redraw()
+                print("DPad Right: Right view")
         except Exception as e:
             print(f"Button action error ({b}): {e}")
+
+    if area:
+        area.tag_redraw()
 
 # -------------------------------
 # Modal Operator
@@ -170,7 +141,6 @@ class SteamDeckOperator(bpy.types.Operator):
 
     _timer = None
     h = None
-    last_analog = None
     last_buttons = None
 
     def modal(self, context, event):
@@ -180,13 +150,10 @@ class SteamDeckOperator(bpy.types.Operator):
                 if data:
                     decoded = decode_deck_report(data)
                     if decoded:
-                        if decoded['buttons'] != self.last_buttons:
-                            handle_buttons(decoded, context)
-                            self.last_buttons = decoded['buttons']
-                        if decoded['analog']:
-                            pan_view(decoded, context)
-                            rotate_view(decoded, context)
-                            self.last_analog = decoded['analog']
+                        handle_buttons(decoded, context)
+                        # Update last_buttons for non-repeating actions
+                        non_repeat_buttons = [b for b in decoded['buttons'] if b not in {"L1", "R1", "L2", "R2"}]
+                        self.last_buttons = non_repeat_buttons
             except Exception as e:
                 print("Read error:", e)
 
@@ -218,6 +185,19 @@ class SteamDeckOperator(bpy.types.Operator):
         else:
             self.report({'ERROR'}, "No suitable interface found")
             return {'CANCELLED'}
+
+        # Disable lizard mode
+        for report in [bytes([0x87, 0x00]), bytes([0x81, 0x00]), bytes([0x8e, 0x00])]:
+            try:
+                self.h.send_feature_report(report)
+            except:
+                pass
+
+        # Request gamepad report
+        try:
+            self.h.write_report(0, bytes([0x01, 0x00] + [0] * 62))
+        except:
+            pass
 
         self.h.set_nonblocking(True)
         wm = context.window_manager
