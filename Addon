@@ -7,6 +7,7 @@ import mathutils
 # Settings
 # -------------------------------
 ROTATE_STEP = 0.0157079  # ~0.9° per tick (~60°/s at 66.67 ticks/s)
+ZOOM_FACTOR = 0.05  # ~5% change in view_distance per press
 
 # -------------------------------
 # Decode HID data
@@ -51,86 +52,104 @@ def get_3d_view_context(context):
     return None, None, None
 
 # -------------------------------
+# Get Timeline/Dope Sheet context
+# -------------------------------
+def get_timeline_context(context):
+    for area in context.screen.areas:
+        if area.type in {'TIMELINE', 'DOPESHEET_EDITOR'}:
+            for region in area.regions:
+                if region.type == 'WINDOW':
+                    override = {'area': area, 'region': region, 'space_data': area.spaces.active}
+                    return override, area
+    print("Error: No Timeline or Dope Sheet found")
+    return None, None
+
+# -------------------------------
 # Handle button actions
 # -------------------------------
 def handle_buttons(decoded, context):
-    override, area, rv3d = get_3d_view_context(context)
-    if not override or not rv3d:
-        return
+    # Get 3D View context for viewport actions
+    view_override, view_area, rv3d = get_3d_view_context(context)
+    # Get Timeline/Dope Sheet context for timeline actions
+    timeline_override, timeline_area = get_timeline_context(context)
 
     buttons = decoded['buttons']
     non_repeat_buttons = [b for b in buttons if b not in {"L1", "R1", "L2", "R2"}]
 
-    # Continuous rotation with L1/R1/L2/R2
-    if "L1" in buttons:
-        try:
-            bpy.ops.view3d.view_orbit(override, angle_x=0, angle_y=ROTATE_STEP)
-            print("L1: Rotate left (Numpad 4)")
-        except Exception as e:
-            print(f"L1 rotation error: {e}")
-            quat = mathutils.Quaternion((0, 0, 1), ROTATE_STEP)
+    # Continuous rotation with L1/R1/L2/R2 (3D Viewport)
+    if view_area and rv3d:
+        if "L1" in buttons:
+            quat = mathutils.Quaternion((0, 0, 1), ROTATE_STEP)  # global Z
             rv3d.view_rotation = quat @ rv3d.view_rotation
-            print("L1: Rotate left (Numpad 4, fallback)")
-    if "R1" in buttons:
-        try:
-            bpy.ops.view3d.view_orbit(override, angle_x=0, angle_y=-ROTATE_STEP)
-            print("R1: Rotate right (Numpad 6)")
-        except Exception as e:
-            print(f"R1 rotation error: {e}")
-            quat = mathutils.Quaternion((0, 0, 1), -ROTATE_STEP)
+            print("L1: Rotate left (global Z)")
+        if "R1" in buttons:
+            quat = mathutils.Quaternion((0, 0, 1), -ROTATE_STEP)  # global Z
             rv3d.view_rotation = quat @ rv3d.view_rotation
-            print("R1: Rotate right (Numpad 6, fallback)")
-    if "L2" in buttons:
-        try:
-            bpy.ops.view3d.view_orbit(override, angle_x=0, angle_y=ROTATE_STEP)
-            print("L2: Rotate down (Numpad 2)")
-        except Exception as e:
-            print(f"L2 rotation error: {e}")
-            quat = mathutils.Quaternion((0, 1, 0), ROTATE_STEP)
+            print("R1: Rotate right (global Z)")
+        if "L2" in buttons:
+            quat = mathutils.Quaternion((1, 0, 0), ROTATE_STEP)  # global X
             rv3d.view_rotation = quat @ rv3d.view_rotation
-            print("L2: Rotate down (Numpad 2, fallback)")
-    if "R2" in buttons:
-        try:
-            bpy.ops.view3d.view_orbit(override, angle_x=0, angle_y=-ROTATE_STEP)
-            print("R2: Rotate up (Numpad 8)")
-        except Exception as e:
-            print(f"R2 rotation error: {e}")
-            quat = mathutils.Quaternion((0, 1, 0), -ROTATE_STEP)
+            print("L2: Rotate up (global X)")
+        if "R2" in buttons:
+            quat = mathutils.Quaternion((1, 0, 0), -ROTATE_STEP)  # global X
             rv3d.view_rotation = quat @ rv3d.view_rotation
-            print("R2: Rotate up (Numpad 8, fallback)")
+            print("R2: Rotate down (global X)")
 
     # Handle non-repeating buttons
     for b in non_repeat_buttons:
         try:
-            if b == "A":
-                bpy.ops.object.select_all(override, action='SELECT')
-                print("A: Select all")
-            elif b == "B":
-                bpy.ops.object.hide_view_clear(override)
+            if b == "A" and view_override and view_area:
+                try:
+                    bpy.ops.view3d.zoom(view_override, delta=0.5)
+                    print("A: Zoom in (Numpad +)")
+                except Exception as e:
+                    print(f"A zoom error: {e}")
+                    if rv3d:
+                        rv3d.view_distance *= (1 - ZOOM_FACTOR)  # Decrease distance (~5%)
+                        print("A: Zoom in (Numpad +, fallback)")
+            elif b == "Y" and view_override and view_area:
+                try:
+                    bpy.ops.view3d.zoom(view_override, delta=-0.5)
+                    print("Y: Zoom out (Numpad -)")
+                except Exception as e:
+                    print(f"Y zoom error: {e}")
+                    if rv3d:
+                        rv3d.view_distance *= (1 + ZOOM_FACTOR)  # Increase distance (~5%)
+                        print("Y: Zoom out (Numpad -, fallback)")
+            elif b == "B" and view_override and view_area:
+                bpy.ops.object.hide_view_clear(view_override)
                 print("B: Show all")
-            elif b == "X":
-                bpy.ops.object.delete(override)
+            elif b == "X" and view_override and view_area:
+                bpy.ops.object.delete(view_override)
                 print("X: Delete")
-            elif b == "Y":
-                bpy.ops.object.duplicate_move(override)
-                print("Y: Duplicate")
             elif b == "DPad Up":
-                bpy.ops.view3d.view_axis(override, type='TOP')
-                print("DPad Up: Top view")
-            elif b == "DPad Down":
-                bpy.ops.view3d.view_axis(override, type='BOTTOM')
+                try:
+                    if timeline_override and timeline_area:
+                        bpy.ops.screen.frame_offset(timeline_override, delta=1)
+                        print("DPad Up: Right arrow key (scrub timeline forward)")
+                    else:
+                        bpy.context.scene.frame_current += 1
+                        print("DPad Up: Right arrow key (scrub timeline forward, no timeline context)")
+                except Exception as e:
+                    print(f"DPad Up error: {e}")
+                    bpy.context.scene.frame_current += 1
+                    print("DPad Up: Right arrow key (scrub timeline forward, fallback)")
+            elif b == "DPad Down" and view_override and view_area:
+                bpy.ops.view3d.view_axis(view_override, type='BOTTOM')
                 print("DPad Down: Bottom view")
-            elif b == "DPad Left":
-                bpy.ops.view3d.view_axis(override, type='LEFT')
+            elif b == "DPad Left" and view_override and view_area:
+                bpy.ops.view3d.view_axis(view_override, type='LEFT')
                 print("DPad Left: Left view")
-            elif b == "DPad Right":
-                bpy.ops.view3d.view_axis(override, type='RIGHT')
+            elif b == "DPad Right" and view_override and view_area:
+                bpy.ops.view3d.view_axis(view_override, type='RIGHT')
                 print("DPad Right: Right view")
         except Exception as e:
             print(f"Button action error ({b}): {e}")
 
-    if area:
-        area.tag_redraw()
+    if view_area:
+        view_area.tag_redraw()
+    if timeline_area:
+        timeline_area.tag_redraw()
 
 # -------------------------------
 # Modal Operator
